@@ -1,0 +1,113 @@
+name: Minecraft Server
+on:
+  workflow_dispatch:
+    inputs:
+      server_name:
+        required: true
+        type: string
+      server_flavor:
+        required: true
+        type: choice
+        default: purpur
+        options: [purpur, paper, fabric, forge]
+      mc_version:
+        required: true
+        type: string
+      ram:
+        required: true
+        type: string
+      duration_minutes:
+        required: true
+        type: number
+
+jobs:
+  mc:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.duration_minutes) + 15 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 21 }
+      - name: Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="${{ secrets.TS_AUTH_KEY }}" --hostname=mc-${{ inputs.server_name }}-${{ github.run_id }}
+          echo "TS_IP=\$(tailscale ip -4)" >> \$GITHUB_ENV
+      - name: Playit
+        run: |
+          curl -sL https://playit.gg/downloads/playit-linux-amd64 -o /tmp/playit && chmod +x /tmp/playit
+          mkdir -p /tmp/playit-data
+          /tmp/playit --secret_path /tmp/playit-data > /tmp/playit.log 2>&1 &
+          sleep 5
+          cat /tmp/playit.log
+      - name: Server
+        run: |
+          python3 << 'PYEOF'
+          import http.server, json, os, subprocess, threading, time, signal, urllib.request
+          os.makedirs('server', exist_ok=True); os.chdir('server')
+          jar = 'server.jar'
+          if not os.path.exists(jar):
+              v = '${{ inputs.mc_version }}'
+              meta = json.loads(urllib.request.urlopen(f'https://api.purpurmc.org/v2/purpur/{v}').read())
+              b = meta['builds']['latest']
+              urllib.request.urlretrieve(f'https://api.purpurmc.org/v2/purpur/{v}/{b}/download', jar)
+          open('eula.txt','w').write('eula=true')
+          ram = '${{ inputs.ram }}'
+          mc = subprocess.Popen(['java',f'-Xms{ram}',f'-Xmx{ram}','-jar',jar,'nogui'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+          lb=[]
+          def r():
+              for l in mc.stdout: lb.append(l); print(l,end='')
+          threading.Thread(target=r,daemon=True).start()
+          ts_ip=os.environ.get('TS_IP','127.0.0.1')
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  try:
+                      import psutil as _p
+                      if self.path=='/stats': return self.sj({'cpu':_p.cpu_percent(),'mem':_p.virtual_memory().percent,'disk':_p.disk_usage('/').percent,'uptime':time.time()})
+                  except: pass
+                  if self.path.startswith('/logs'):
+                      s=int(self.path.split('since=')[1]) if 'since=' in self.path else 0; return self.sj({'logs':lb[s:],'total':len(lb)})
+                  if self.path.startswith('/files/'):
+                      p=self.path[7:]
+                      if os.path.isfile(p): self.send_response(200);self.send_header('Content-Type','application/octet-stream');self.end_headers();open(p,'rb').readinto(self.wfile)
+                      elif os.path.isdir(p): self.sj({'files':[{'name':x,'dir':os.path.isdir(os.path.join(p,x)),'size':os.path.getsize(os.path.join(p,x))} for x in os.listdir(p)]})
+                      else: self.sj({'error':'not found'},404)
+                      return
+                  if self.path=='/tunnel':
+                      import re as _re
+                      raw='';p='/tmp/playit.log'
+                      if os.path.exists(p): raw=open(p).read()[-3000:]
+                      cm=_re.search(r'https://playit.gg/claim/[w-]+',raw)
+                      cu=cm.group(0) if cm else ''
+                      tm=_re.search(r'([w-]+.ply.gg):(d+)',raw)
+                      tu=f'{tm.group(1)}:{tm.group(2)}' if tm else ''
+                      return self.sj({'raw':raw,'claim_url':cu,'url':tu})
+                  self.sj({'error':'unknown'},404)
+              def do_POST(self):
+                  if self.path=='/command':
+                      l=int(self.headers.get('Content-Length',0)); c=self.rfile.read(l).decode() if l else ''
+                      mc.stdin.write(c+'\n');mc.stdin.flush();self.sj({'ok':True})
+              def do_PUT(self):
+                  if self.path.startswith('/files/'):
+                      p=self.path[7:];l=int(self.headers.get('Content-Length',0));b=self.rfile.read(l) if l else b''
+                      os.makedirs(os.path.dirname(p) or '.',exist_ok=True);open(p,'wb').write(b);self.sj({'ok':True})
+              def do_DELETE(self):
+                  if self.path.startswith('/files/'):
+                      p=self.path[7:]
+                      if os.path.isfile(p): os.remove(p)
+                      elif os.path.isdir(p): import shutil; shutil.rmtree(p)
+                      self.sj({'ok':True})
+              def sj(self,d,c=200):self.send_response(c);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(json.dumps(d).encode())
+              def log_message(self,*a):pass
+          httpd=http.server.HTTPServer((ts_ip,8080),H)
+          print(f'MONITOR_READY http://{ts_ip}:8080')
+          signal.signal(signal.SIGTERM,lambda *a:(httpd.shutdown(),mc.terminate()))
+          end=time.time()+int(os.environ.get('DURATION_MINUTES','120'))*60
+          while time.time()<end: httpd.handle_request()
+          PYEOF
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+      - name: Keep alive
+        run: |
+          echo "Server ${{ inputs.server_name }} running on TS_IP=$TS_IP"
+          wait
